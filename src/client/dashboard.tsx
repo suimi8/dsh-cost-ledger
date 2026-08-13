@@ -165,11 +165,14 @@ export function Dashboard() {
               {{ overview: '概览', models: '模型', providers: 'Provider', logs: '日志', settings: '⚙️设置' }[tb]}
             </button>
           ))}
-          {tab !== 'settings' && (
-            <select value={range} onChange={(e) => setRange(e.target.value as typeof range)} style={S.select}>
-              {RANGES.map((r) => <option key={r} value={r}>{RANGE_LABELS[r]}</option>)}
-            </select>
-          )}
+          <select
+            value={range}
+            onChange={(e) => setRange(e.target.value as typeof range)}
+            style={{ ...S.select, visibility: tab === 'settings' ? 'hidden' as const : 'visible' as const, flexShrink: 0 as const }}
+            aria-hidden={tab === 'settings'}
+          >
+            {RANGES.map((r) => <option key={r} value={r}>{RANGE_LABELS[r]}</option>)}
+          </select>
         </div>
       </div>
 
@@ -286,106 +289,285 @@ function Kpi({ label, value, sub, accent }: { label: string; value: string; sub?
   )
 }
 
-/** Settings panel: edit model pricing (JSON) + daily budget, persisted via host API. */
+/** Settings panel: edit model pricing as a key-value table + AI import. */
+interface PriceRow { model: string; input: string; output: string; cacheRead: string; cacheWrite: string }
 function SettingsPanel() {
   const [cfg, setCfg] = useState<PluginConfig | null>(null)
-  const [pricingText, setPricingText] = useState('')
+  const [rows, setRows] = useState<PriceRow[]>([])
   const [budget, setBudget] = useState('')
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
+  const [showImport, setShowImport] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [importing, setImporting] = useState(false)
+
+  // Selective cleanup state.
+  interface CleanupOpts { models: string[]; providers: (string | null)[]; sessions: (string | null)[]; projects: (string | null)[] }
+  const [cleanupOpts, setCleanupOpts] = useState<CleanupOpts>({ models: [], providers: [], sessions: [], projects: [] })
+  const [cModel, setCModel] = useState('')
+  const [cProvider, setCProvider] = useState('')
+  const [cSession, setCSession] = useState('')
+  const [cProject, setCProject] = useState('')
+  const [cDays, setCDays] = useState('')
+  const [cleaning, setCleaning] = useState(false)
 
   const load = useCallback(async () => {
     try {
-      const c = await fetch('/api/cost-ledger/config').then((r) => r.json())
+      const c: PluginConfig = await fetch('/api/cost-ledger/config').then((r) => r.json())
       setCfg(c)
-      setPricingText(JSON.stringify(c.pricing ?? {}, null, 2))
+      const p = c.pricing ?? {}
+      setRows(Object.entries(p).map(([model, v]) => ({
+        model,
+        input: String(v.input ?? ''), output: String(v.output ?? ''),
+        cacheRead: String(v.cacheRead ?? ''), cacheWrite: String(v.cacheWrite ?? ''),
+      })))
       setBudget(String(c.defaultDailyBudget ?? 0))
+      // Load cleanup filter options (distinct model/provider/session/project).
+      // Non-2xx (e.g. 404 on an older host without the endpoint) yields a
+      // non-array shape, so guard every field — the dropdowns just stay empty.
+      try {
+        const r = await fetch('/api/cost-ledger/cleanup/filters')
+        if (r.ok) {
+          const o = await r.json().catch(() => ({}))
+          setCleanupOpts({
+            models: Array.isArray(o.models) ? o.models : [],
+            providers: Array.isArray(o.providers) ? o.providers : [],
+            sessions: Array.isArray(o.sessions) ? o.sessions : [],
+            projects: Array.isArray(o.projects) ? o.projects : [],
+          })
+        }
+      } catch { /* ignore — cleanup still works without dropdowns */ }
     } catch (e) { setMsg(String(e)) }
   }, [])
   useEffect(() => { load() }, [load])
 
+  const rowsToPricing = (rs: PriceRow[]): PluginConfig['pricing'] => {
+    const out: PluginConfig['pricing'] = {}
+    for (const r of rs) {
+      const m = r.model.trim()
+      if (!m) continue
+      out[m] = {
+        input: Number(r.input) || 0, output: Number(r.output) || 0,
+        cacheRead: Number(r.cacheRead) || 0, cacheWrite: Number(r.cacheWrite) || 0,
+      }
+    }
+    return out
+  }
+
+  const updateRow = (i: number, field: keyof PriceRow, val: string) => {
+    setRows((rs) => rs.map((r, idx) => idx === i ? { ...r, [field]: val } : r))
+  }
+  const addRow = () => setRows((rs) => [...rs, { model: '', input: '', output: '', cacheRead: '', cacheWrite: '' }])
+  const removeRow = (i: number) => setRows((rs) => rs.filter((_, idx) => idx !== i))
+
+  // Built-in official pricing presets (元/百万 token).
+  const PRESETS: Record<string, PriceRow[]> = {
+    'DeepSeek V4': [
+      { model: 'deepseek-v4-flash', input: '0.1', output: '3', cacheRead: '9', cacheWrite: '3' },
+      { model: 'deepseek-v4-pro', input: '0.3', output: '9', cacheRead: '27', cacheWrite: '9' },
+    ],
+    'DeepSeek V3/R1': [
+      { model: 'deepseek-chat', input: '2', output: '8', cacheRead: '0.5', cacheWrite: '8' },
+      { model: 'deepseek-reasoner', input: '4', output: '16', cacheRead: '1', cacheWrite: '8' },
+    ],
+  }
+  const applyPreset = (key: string) => {
+    const preset = PRESETS[key]
+    setRows((rs) => {
+      const map = new Map(rs.map((r) => [r.model.trim(), r]))
+      for (const p of preset) {
+        const ex = map.get(p.model)
+        if (ex) Object.assign(ex, p)
+        else map.set(p.model, { ...p })
+      }
+      return [...map.values()]
+    })
+    setMsg(`已填入 ${key} 价格,点击保存生效`)
+  }
+
+  // AI import: send the pasted price text to the host, which calls the LLM to
+  // parse free-form text (from 官网 / sub2api / newapi etc.) into structured
+  // prices. Replaces the old client-side regex heuristic.
+  const doImport = async () => {
+    setImporting(true); setMsg(null)
+    try {
+      const text = importText.trim()
+      if (!text) { setMsg('❌ 请粘贴价格文本'); return }
+      const res = await fetch('/api/cost-ledger/parse-prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      })
+      const j = await res.json().catch(() => ({}))
+      if (!res.ok) { setMsg('❌ ' + (j.error ?? `HTTP ${res.status}`)); return }
+      const prices: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = j.prices ?? {}
+      const newRows = Object.entries(prices).map(([model, v]) => ({
+        model,
+        input: String(v.input ?? 0),
+        output: String(v.output ?? 0),
+        cacheRead: String(v.cacheRead ?? 0),
+        cacheWrite: String(v.cacheWrite ?? 0),
+      }))
+      setRows((rs) => {
+        const map = new Map(rs.map((r) => [r.model.trim(), r]))
+        for (const r of newRows) {
+          const ex = map.get(r.model)
+          if (ex) Object.assign(ex, r)
+          else map.set(r.model, { ...r })
+        }
+        return [...map.values()]
+      })
+      const n = newRows.length
+      setMsg(`✅ 已识别并导入 ${n} 个模型价格`)
+      setShowImport(false)
+      setImportText('')
+    } catch (e) {
+      setMsg('❌ 识别失败: ' + String(e))
+    } finally { setImporting(false) }
+  }
+
   const save = async () => {
     setSaving(true); setMsg(null)
     try {
-      const pricing = JSON.parse(pricingText)
+      const pricing = rowsToPricing(rows)
       const patch: Partial<PluginConfig> = { pricing }
       const b = Number(budget)
       if (Number.isFinite(b)) patch.defaultDailyBudget = b
       const res = await fetch('/api/cost-ledger/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setMsg('✅ 已保存,新对话的 token 将按新价格计算')
-      load()
     } catch (e) {
       setMsg('❌ ' + String(e))
     } finally { setSaving(false) }
   }
 
-  const [cleanupDays, setCleanupDays] = useState('30')
-  const [autoCleanup, setAutoCleanup] = useState(false)
+  /** Label for a nullable filter value in a <select>. */
+  const lbl = (v: string | null, fallback = '(空)') => (v === null ? fallback : v || fallback)
 
-  // Built-in official pricing presets (元/百万 token), categorized.
-  const PRESETS: Record<string, Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>> = {
-    'DeepSeek 官方 (V4)': {
-      'deepseek-v4-flash': { input: 0.1, output: 3, cacheRead: 9, cacheWrite: 3 },
-      'deepseek-v4-pro': { input: 0.3, output: 9, cacheRead: 27, cacheWrite: 9 },
-    },
-    'DeepSeek 旧版 (V3/R1)': {
-      'deepseek-chat': { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 8 },
-      'deepseek-reasoner': { input: 4, output: 16, cacheRead: 1, cacheWrite: 8 },
-    },
-  }
-
-  const applyPreset = (key: string) => {
-    const p = PRESETS[key]
+  // Selective cleanup: send whichever filters the user picked. If none are set,
+  // refuse (require explicit "清空全部" instead) to avoid accidental mass delete.
+  const doCleanup = async (all = false) => {
+    setCleaning(true); setMsg(null)
     try {
-      const cur = JSON.parse(pricingText || '{}')
-      setPricingText(JSON.stringify({ ...cur, ...p }, null, 2))
-      setMsg(`已填入 ${key} 价格,点击保存生效`)
-    } catch { setMsg('❌ 当前 JSON 格式错误,无法合并') }
-  }
-
-  const doCleanup = async () => {
-    const days = Math.max(1, Number(cleanupDays) || 30)
-    try {
-      const r = await fetch('/api/cost-ledger/cleanup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days }) })
-      const j = await r.json()
-      setMsg(`已清理 ${j.deleted} 条,剩余 ${j.remaining} 条`)
-    } catch (e) { setMsg('❌ ' + String(e)) }
+      const filter: Record<string, unknown> = {}
+      if (all) {
+        filter.all = true
+      } else {
+        if (cModel) filter.model = cModel
+        if (cProvider) filter.provider = cProvider === '__null__' ? null : cProvider
+        if (cSession) filter.sessionId = cSession === '__null__' ? null : cSession
+        if (cProject) filter.project = cProject === '__null__' ? null : cProject
+        const days = Number(cDays)
+        if (cDays && Number.isFinite(days) && days > 0) filter.olderThanDays = days
+      }
+      if (!all && Object.keys(filter).length === 0) {
+        setMsg('❌ 请至少选择一个清理条件,或点击「清空全部」')
+        return
+      }
+      const r = await fetch('/api/cost-ledger/cleanup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(filter),
+      })
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok) { setMsg('❌ ' + (j.error ?? `HTTP ${r.status}`)); return }
+      setMsg(`${all ? '已清空' : '已清理'} ${j.deleted} 条,剩余 ${j.remaining} 条`)
+      // Refresh filter options (the picked value may now be gone).
+      load()
+    } catch (e) {
+      setMsg('❌ ' + String(e))
+    } finally { setCleaning(false) }
   }
 
   return (
     <div style={{ fontSize: 13 }}>
-      <div style={S.sectionTitle}>模型价格 (JSON · 元/百万 token)</div>
-      <div style={{ display: 'flex', gap: 6, marginBottom: 6, flexWrap: 'wrap' }}>
-        {Object.keys(PRESETS).map((k) => (
-          <button key={k} onClick={() => applyPreset(k)} style={S.presetBtn}>{k}</button>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <span style={S.sectionTitle}>模型价格 (元/百万 token)</span>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {Object.keys(PRESETS).map((k) => (
+            <button key={k} onClick={() => applyPreset(k)} style={S.presetBtn}>{k}</button>
+          ))}
+          <button onClick={() => setShowImport((v) => !v)} style={S.presetBtn}>🤖 AI 导入</button>
+          <button onClick={addRow} style={S.presetBtn}>+ 添加</button>
+        </div>
+      </div>
+
+      {showImport && (
+        <div style={{ marginBottom: 8, padding: 8, background: 'var(--dsw-alias-bg-secondary,#f5f5f5)', borderRadius: 6 }}>
+          <div style={{ fontSize: 11, color: 'var(--dsw-alias-label-tertiary,#999)', marginBottom: 4 }}>
+            粘贴模型 API 价格文本(任意格式,来自官网/sub2api/newapi 等),AI 会自动解析。需要先在 Agent 设置中配置默认模型。
+          </div>
+          <textarea value={importText} onChange={(e) => setImportText(e.target.value)} style={{ ...S.textarea, minHeight: '70px' }}
+            placeholder={'例如:\nDeepSeek V4 Flash 输入 0.1元/百万,输出 3元,缓存命中 9元\nglm-5-2 输入 0.5 输出 2 缓存写入 2'} />
+          <button onClick={doImport} disabled={importing} style={{ ...S.presetBtn, marginTop: 4 }}>{importing ? '识别中…' : '识别并导入'}</button>
+        </div>
+      )}
+
+      {/* Key-value price table: each row = model + 4 number inputs */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr 1fr 1fr 28px', gap: '4px', fontSize: 11, alignItems: 'center' }}>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-tertiary,#999)' }}>模型</div>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-tertiary,#999)' }}>输入</div>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-tertiary,#999)' }}>输出</div>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-tertiary,#999)' }}>缓存命中</div>
+        <div style={{ fontWeight: 600, color: 'var(--dsw-alias-label-tertiary,#999)' }}>缓存创建</div>
+        <div></div>
+        {rows.map((r, i) => (
+          <RowFragment key={i} row={r} onChange={(f, v) => updateRow(i, f, v)} onRemove={() => removeRow(i)} />
         ))}
       </div>
-      <textarea value={pricingText} onChange={(e) => setPricingText(e.target.value)} style={S.textarea}
-        placeholder={'{\n  "glm-5-2": { "input": 0.5, "output": 2, "cacheRead": 0.05, "cacheWrite": 2 }\n}'} />
-      <div style={S.hint}>每个模型 4 字段:输入成本 / 输出成本 / 缓存命中 / 缓存创建。点上方按钮填入官方价,或从模型官网/上游(sub2api、newapi 等)查后手填。</div>
 
       <div style={{ ...S.sectionTitle, marginTop: 12 }}>每日预算上限 (元,0=不限)</div>
       <input type="text" inputMode="numeric" value={budget} onChange={(e) => setBudget(e.target.value)} style={S.input} />
 
-      <div style={{ ...S.sectionTitle, marginTop: 12 }}>数据清理</div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 12 }}>删除</span>
-        <input type="text" inputMode="numeric" value={cleanupDays} onChange={(e) => setCleanupDays(e.target.value)} style={{ ...S.input, width: 60 }} />
-        <span style={{ fontSize: 12 }}>天前的记录</span>
-        <button onClick={doCleanup} style={S.presetBtn}>立即清理</button>
-        <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input type="checkbox" checked={autoCleanup} onChange={(e) => setAutoCleanup(e.target.checked)} /> 启动时自动清理
-        </label>
+      <div style={{ ...S.sectionTitle, marginTop: 12 }}>数据清理 (按条件筛选)</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', marginBottom: 8 }}>
+        <select value={cModel} onChange={(e) => setCModel(e.target.value)} style={S.select}>
+          <option value="">模型: 全部</option>
+          {cleanupOpts.models.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <select value={cProvider} onChange={(e) => setCProvider(e.target.value)} style={S.select}>
+          <option value="">Provider: 全部</option>
+          {cleanupOpts.providers.map((p, i) => <option key={i} value={p === null ? '__null__' : p}>{lbl(p, '(无 provider)')}</option>)}
+        </select>
+        <select value={cSession} onChange={(e) => setCSession(e.target.value)} style={S.select}>
+          <option value="">会话: 全部</option>
+          {cleanupOpts.sessions.map((s, i) => <option key={i} value={s === null ? '__null__' : s}>{lbl(s, '(无会话)')}</option>)}
+        </select>
+        <select value={cProject} onChange={(e) => setCProject(e.target.value)} style={S.select}>
+          <option value="">项目: 全部</option>
+          {cleanupOpts.projects.map((p, i) => <option key={i} value={p === null ? '__null__' : p}>{lbl(p, '(无项目)')}</option>)}
+        </select>
       </div>
-      <div style={S.hint}>autoCleanup 勾选后,插件加载时自动删除超过 N 天的旧记录(配置: cordis.patch.yml 的 cleanupDays)。</div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+        <span style={{ fontSize: 12 }}>且早于</span>
+        <input type="text" inputMode="numeric" value={cDays} onChange={(e) => setCDays(e.target.value)} placeholder="天数" style={{ ...S.input, width: 60 }} />
+        <span style={{ fontSize: 12 }}>天前的记录(留空=不限时间)</span>
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button onClick={() => doCleanup(false)} disabled={cleaning} style={S.presetBtn}>{cleaning ? '清理中…' : '🗑 按条件清理'}</button>
+        <button onClick={() => { if (window.confirm('确定清空全部调用记录?此操作不可恢复。')) doCleanup(true) }} disabled={cleaning} style={{ ...S.presetBtn, color: '#e5484d', borderColor: '#e5484d' }}>清空全部</button>
+      </div>
 
       <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-        <button onClick={save} disabled={saving} style={S.saveBtn}>{saving ? '保存中…' : '💾 保存价格'}</button>
+        <button onClick={save} disabled={saving} style={S.saveBtn}>{saving ? '保存中…' : '💾 保存'}</button>
         {msg && <span style={{ fontSize: 12, color: msg.startsWith('✅') || msg.startsWith('已') ? '#10b981' : '#e5484d' }}>{msg}</span>}
       </div>
       {cfg?.dbPath && <div style={{ ...S.hint, marginTop: 8 }}>账本路径: {cfg.dbPath}</div>}
     </div>
+  )
+}
+
+/** One price row: model input + 4 number inputs + remove button. */
+function RowFragment({ row, onChange, onRemove }: { row: PriceRow; onChange: (f: keyof PriceRow, v: string) => void; onRemove: () => void }) {
+  const cell = { padding: '3px 4px', fontSize: '11px', borderRadius: '4px', border: '1px solid var(--dsw-alias-border,#ddd)', background: 'var(--dsw-alias-bg,#fff)', color: 'var(--dsw-alias-label-primary,#111)', boxSizing: 'border-box' as const, width: '100%' as const }
+  return (
+    <>
+      <input type="text" value={row.model} onChange={(e) => onChange('model', e.target.value)} placeholder="模型名" style={cell} />
+      <input type="text" inputMode="decimal" value={row.input} onChange={(e) => onChange('input', e.target.value)} style={cell} />
+      <input type="text" inputMode="decimal" value={row.output} onChange={(e) => onChange('output', e.target.value)} style={cell} />
+      <input type="text" inputMode="decimal" value={row.cacheRead} onChange={(e) => onChange('cacheRead', e.target.value)} style={cell} />
+      <input type="text" inputMode="decimal" value={row.cacheWrite} onChange={(e) => onChange('cacheWrite', e.target.value)} style={cell} />
+      <button onClick={onRemove} style={{ padding: 0, border: 'none', background: 'transparent', color: '#e5484d', cursor: 'pointer', fontSize: '15px' }}>×</button>
+    </>
   )
 }
 
@@ -414,11 +596,11 @@ function Table({ head, rows }: { head: string[]; rows: string[][] }) {
 
 const S = {
   wrap: { boxSizing: 'border-box' as const, height: '100%', overflow: 'auto' as const, padding: '16px', color: 'var(--dsw-alias-label-primary,#111)', background: 'var(--dsw-alias-bg,#fff)' },
-  header: { display: 'flex' as const, alignItems: 'center' as const, justifyContent: 'space-between' as const, marginBottom: '12px', gap: '8px', flexWrap: 'wrap' as const },
-  title: { fontSize: '16px', fontWeight: 700 },
-  controls: { display: 'flex' as const, gap: '4px', alignItems: 'center' as const, flexWrap: 'wrap' as const },
-  tab: { padding: '4px 10px', fontSize: '12px', border: '1px solid var(--dsw-alias-border,#ddd)', background: 'transparent', color: 'var(--dsw-alias-label-secondary,#666)', borderRadius: '4px', cursor: 'pointer' as const },
-  tabActive: { padding: '4px 10px', fontSize: '12px', border: '1px solid var(--dsw-alias-accent,#0066cc)', background: 'var(--dsw-alias-accent,#0066cc)', color: '#fff', borderRadius: '4px', cursor: 'pointer' as const, fontWeight: 600 },
+  header: { display: 'flex' as const, alignItems: 'center' as const, justifyContent: 'space-between' as const, marginBottom: '12px', gap: '6px', flexWrap: 'nowrap' as const, overflowX: 'auto' as const },
+  title: { fontSize: '15px', fontWeight: 700, flexShrink: 0 as const },
+  controls: { display: 'flex' as const, gap: '3px', alignItems: 'center' as const, flexWrap: 'nowrap' as const, overflowX: 'auto' as const },
+  tab: { padding: '3px 7px', fontSize: '11px', border: '1px solid var(--dsw-alias-border,#ddd)', background: 'transparent', color: 'var(--dsw-alias-label-secondary,#666)', borderRadius: '4px', cursor: 'pointer' as const, flexShrink: 0 as const, whiteSpace: 'nowrap' as const },
+  tabActive: { padding: '3px 7px', fontSize: '11px', border: '1px solid var(--dsw-alias-accent,#0066cc)', background: 'var(--dsw-alias-accent,#0066cc)', color: '#fff', borderRadius: '4px', cursor: 'pointer' as const, fontWeight: 600, flexShrink: 0 as const, whiteSpace: 'nowrap' as const },
   select: { fontSize: '12px', padding: '3px 6px', background: 'var(--dsw-alias-bg-secondary,#f5f5f5)', color: 'var(--dsw-alias-label-primary)', border: '1px solid var(--dsw-alias-border,#ddd)', borderRadius: '4px' },
   kpiGrid: { display: 'grid' as const, gridTemplateColumns: 'repeat(auto-fill,minmax(120px,1fr))', gap: '8px', marginBottom: '14px' },
   kpi: { padding: '10px', background: 'var(--dsw-alias-bg-secondary,#f5f5f5)', borderRadius: '8px' },

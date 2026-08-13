@@ -46,6 +46,24 @@ export interface BudgetRow {
   window: string
 }
 
+/** Filter for selective cleanup. All fields optional; an empty filter deletes every row. */
+export interface CleanupFilter {
+  /** Delete rows with ts older than (now - N days). 0/undefined = no age limit. */
+  olderThanDays?: number
+  /** Delete rows with ts before this ISO timestamp. */
+  beforeTs?: string
+  /** Delete rows with ts after this ISO timestamp. */
+  sinceTs?: string
+  /** Delete rows matching this exact model name. */
+  model?: string
+  /** Delete rows matching this exact provider. null matches rows with no provider. */
+  provider?: string | null
+  /** Delete rows matching this session id. null matches rows with no session. */
+  sessionId?: string | null
+  /** Delete rows matching this project label. null matches rows with no project. */
+  project?: string | null
+}
+
 /** Price needed to recompute cost from a token aggregate. */
 export interface ModelPriceLike {
   input: number
@@ -358,6 +376,54 @@ export class Ledger {
     const cutoff = new Date(Date.now() - days * 86400000).toISOString()
     const info = this.db.prepare(`DELETE FROM usage WHERE ts < @cutoff`).run({ cutoff })
     return Number(info.changes)
+  }
+
+  /**
+   * Delete usage rows matching an optional filter. With no filter fields set,
+   * deletes EVERYTHING (full clear). Returns the number of rows deleted.
+   */
+  cleanup(filter: CleanupFilter = {}): number {
+    const where: string[] = []
+    const params: Record<string, string | number | null> = {}
+    if (filter.olderThanDays && filter.olderThanDays > 0) {
+      where.push('ts < @cutoff')
+      params.cutoff = new Date(Date.now() - filter.olderThanDays * 86400000).toISOString()
+    }
+    if (filter.beforeTs) { where.push('ts <= @beforeTs'); params.beforeTs = filter.beforeTs }
+    if (filter.sinceTs) { where.push('ts >= @sinceTs'); params.sinceTs = filter.sinceTs }
+    if (filter.model) { where.push('model = @model'); params.model = filter.model }
+    if (filter.provider !== undefined) {
+      where.push(filter.provider === null ? 'provider IS NULL' : 'provider = @provider')
+      if (filter.provider !== null) params.provider = filter.provider
+    }
+    if (filter.sessionId !== undefined) {
+      where.push(filter.sessionId === null ? 'session_id IS NULL' : 'session_id = @sessionId')
+      if (filter.sessionId !== null) params.sessionId = filter.sessionId
+    }
+    if (filter.project !== undefined) {
+      where.push(filter.project === null ? 'project IS NULL' : 'project = @project')
+      if (filter.project !== null) params.project = filter.project
+    }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : ''
+    const info = this.db.prepare(`DELETE FROM usage ${clause}`).run(params)
+    return Number(info.changes)
+  }
+
+  /** Distinct values present in the DB, for the cleanup filter dropdowns. */
+  cleanupFilterOptions(): {
+    models: string[]
+    providers: (string | null)[]
+    sessions: (string | null)[]
+    projects: (string | null)[]
+  } {
+    const q = (expr: string) =>
+      this.db.prepare(`SELECT DISTINCT ${expr} AS v FROM usage ORDER BY v`).all() as { v: string | null }[]
+    return {
+      models: q('model').map((r) => r.v ?? ''),
+      providers: q('provider').map((r) => r.v),
+      sessions: q('session_id').map((r) => r.v),
+      projects: q('project').map((r) => r.v),
+    }
   }
 
   /** Total record count (for settings display). */

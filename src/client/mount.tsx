@@ -64,7 +64,7 @@ export function mountCostLedger(): () => void {
   close.addEventListener('click', () => { open = false; sync() })
 
   const inner = document.createElement('div')
-  Object.assign(inner.style, { flex: '1', overflow: 'auto' } as const)
+  Object.assign(inner.style, { flex: '1', overflow: 'auto', paddingTop: '44px' } as const)
 
   drawer.appendChild(close)
   drawer.appendChild(inner)

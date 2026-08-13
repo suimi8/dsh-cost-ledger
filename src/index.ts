@@ -291,15 +291,43 @@ export function apply(ctx: Context, config: ConfigType) {
 
   attachTokenListener(ctx, ledger, getConfigWithOverrides, contextOf)
   registerTools(ctx, ledger, getConfigWithOverrides, contextOf)
+
+  // The default model selection (provider + model) the Agent loop uses, owned
+  // by the `agentDefaultModel` service. We resolve it dynamically — the same
+  // ctx.inject pattern used for webServer — so the parse-prices endpoint can
+  // call ctx.llm.stream() with a concrete provider/model. Captured once the
+  // service is up; null until then (the endpoint returns 503 in that window).
+  let defaultModel: { provider: string; model: string } | null = null
+  ;(ctx as unknown as { inject?: (deps: string[], cb: (c: any) => void) => unknown }).inject?.(
+    ['agentDefaultModel'],
+    (svcCtx) => {
+      try {
+        const svc = typeof svcCtx?.get === 'function' ? svcCtx.get('agentDefaultModel') : undefined
+        if (svc && typeof svc.currentSelection === 'function') {
+          const sel = svc.currentSelection()
+          if (sel?.provider && sel?.model) defaultModel = { provider: sel.provider, model: sel.model }
+        }
+      } catch {
+        /* service not yet active — stays null until it resolves */
+      }
+    },
+  )
+
   // webServer is web-profile-only (headless has none). Use ctx.inject to wait
   // for it dynamically: under `dsh web` the callback runs and registers the
   // HTTP API; under headless it never runs (no panel needed there), and the
   // plugin still loads — unlike declaring `webServer` in the static `inject`,
   // which would fail the plugin under headless.
+  //
+  // We pass the MAIN ctx (not the webServer inject's child context): the HTTP
+  // handler needs ctx.llm, which is only injectable from the main plugin
+  // context (`inject = ['llm', ...]`); the child only guarantees `webServer`.
+  // webServer is fetched internally via ctx.get('webServer'), which resolves
+  // against the root registry regardless of which context object is passed.
   ;(ctx as unknown as { inject?: (deps: string[], cb: (c: any) => void) => unknown }).inject?.(
     ['webServer'],
-    (webCtx) => {
-      registerHttpApi(webCtx, ledger, getConfigWithOverrides, setConfig)
+    () => {
+      registerHttpApi(ctx, ledger, getConfigWithOverrides, setConfig, () => defaultModel)
     },
   )
 
