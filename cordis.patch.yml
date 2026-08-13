@@ -1,0 +1,19 @@
+# dsh-cost-ledger bundle patch.
+#
+# When installed via `dsh plugin --profile web add <package-or-path>`, the host
+# links this package into the profile's node_modules and loads this patch as a
+# bundle layer (declared via package.json `dsh.bundle.patch`). The `name` below
+# resolves as a module specifier from the profile directory, so a package name
+# (or a subpath export) is correct here — NOT an absolute path.
+#
+# For LOCAL development without installing, use the `--patch` overlay form
+# instead (see README "Local development"), which takes an absolute path.
+
+- insert:
+    - id: cost-ledger
+      name: 'dsh-cost-ledger'
+      config:
+        dbPath: 'dsh-cost-ledger/ledger.db'
+        defaultDailyBudget: 0
+        cleanupDays: 0
+        pricing: {}
