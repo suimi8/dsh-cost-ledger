@@ -283,10 +283,21 @@ export function apply(ctx: Context, config: ConfigType) {
   // directly: those are services that require their own `inject` entry, and
   // accessing an uninjected service throws "cannot get property without inject".
   // The token listener already prefers the event-supplied sessionId (from
-  // GenerateOptions); project is derived from the workspace cwd as a fallback.
+  // GenerateOptions); project is derived from the workspace cwd basename as a
+  // best-effort label (null when no cwd is available).
+  const projectLabel = (() => {
+    try {
+      const cwd = process.cwd()
+      if (!cwd) return null
+      const base = cwd.split(/[\\/]/).filter(Boolean).pop()
+      return base || null
+    } catch {
+      return null
+    }
+  })()
   const contextOf = () => ({
     sessionId: null as string | null,
-    project: null as string | null,
+    project: projectLabel,
   })
 
   attachTokenListener(ctx, ledger, getConfigWithOverrides, contextOf)

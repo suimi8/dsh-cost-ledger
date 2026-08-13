@@ -151,10 +151,14 @@ function extractPrices(raw: string): ParsePricesResponse['prices'] {
   }
   const out: ParsePricesResponse['prices'] = {}
   for (const [model, val] of Object.entries(obj as Record<string, unknown>)) {
-    if (typeof model !== 'string' || !model.trim()) continue
+    if (typeof model !== 'string') continue
+    const key = model.trim()
+    // Validate the model-name key: non-empty, bounded length, no control chars.
+    // Unconstrained keys would pollute resolvePrice's prefix matching.
+    if (!key || key.length > 128 || /[\x00-\x1f\x7f]/.test(key)) continue
     if (!val || typeof val !== 'object' || Array.isArray(val)) continue
     const v = val as Record<string, unknown>
-    out[model.trim()] = {
+    out[key] = {
       input: num(v.input),
       output: num(v.output),
       cacheRead: num(v.cacheRead),
@@ -188,6 +192,43 @@ function resolveSince(range: string): string | undefined {
     return d.toISOString()
   }
   return range
+}
+
+/**
+ * Guard for write/POST endpoints. Rejects cross-origin browsers requests that a
+ * malicious page can still fire (simple <form> POSTs and `fetch(...,{mode:'no-cors'})`).
+ *
+ * `webServer` serves the Web UI from the same origin as this API. Legitimate
+ * same-origin fetches carry a JSON `Content-Type`, which a cross-origin simple
+ * request cannot set. A cross-origin simple POST (the kind a hostile page
+ * fires) arrives with a non-JSON Content-Type (or none), so we 403 it.
+ *
+ * This is a same-origin CSRF guard, not authentication: it raises the bar so a
+ * random webpage cannot wipe the ledger or flip pricing without already being
+ * able to run arbitrary JS against the DSH origin.
+ */
+function isAuthorizedWrite(req: any): boolean {
+  const ct = String(req?.headers?.['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+  if (ct !== 'application/json') return false
+  // Origin/Referer, when present, must match the host (same-origin). Absent
+  // Origin (non-browser callers like curl) is allowed — it is not a CSRF vector.
+  const origin = req?.headers?.origin
+  const referer = req?.headers?.referer
+  const host = req?.headers?.host
+  if (host) {
+    if (origin && !sameHost(origin, host)) return false
+    if (referer && !sameHost(referer, host)) return false
+  }
+  return true
+}
+
+function sameHost(url: string, host: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.host === host
+  } catch {
+    return false
+  }
 }
 
 function sendJson(res: any, status: number, body: unknown): void {
@@ -261,7 +302,7 @@ export function registerHttpApi(
         let budget: SummaryResponse['budget']
         const limit = config.defaultDailyBudget
         if (limit > 0) {
-          const spent = ledger.spentSince(resolveSince('today')!)
+          const spent = ledger.spentSince(resolveSince('today')!, undefined, priceResolver)
           budget = {
             label: 'daily',
             limit,
@@ -304,6 +345,7 @@ export function registerHttpApi(
 
       if (path === '/api/cost-ledger/cleanup') {
         if (req.method !== 'POST') return sendJson(res, 200, { count: ledger.count() })
+        if (!isAuthorizedWrite(req)) return sendJson(res, 403, { error: 'forbidden: cross-origin write blocked' })
         const body = await readBody(req)
         let parsed: any
         try {
@@ -350,6 +392,7 @@ export function registerHttpApi(
         }
         if (req.method === 'POST') {
           if (!setConfig) return sendJson(res, 501, { error: 'config write unavailable' })
+          if (!isAuthorizedWrite(req)) return sendJson(res, 403, { error: 'forbidden: cross-origin write blocked' })
           const body = await readBody(req)
           let patch: Partial<CostLedgerConfig>
           try {
@@ -369,6 +412,7 @@ export function registerHttpApi(
       if (path === '/api/cost-ledger/parse-prices') {
         if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
         if (!getProviderModel) return sendJson(res, 501, { error: 'parse-prices unavailable' })
+        if (!isAuthorizedWrite(req)) return sendJson(res, 403, { error: 'forbidden: cross-origin write blocked' })
         const body = await readBody(req)
         let text: string
         try {

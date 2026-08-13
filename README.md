@@ -63,13 +63,22 @@ dsh web --patch ./cordis.patch.yml
 
 ## Pricing — built-in official rates
 
-Built-in model pricing (元/百万 tokens, from each platform's official pricing page):
-- `deepseek-v4-flash` — input 0.10 / output 3.0 / cacheRead 9.0 (peak tier)
-- `deepseek-v4-pro` — input 0.30 / output 9.0 / cacheRead 27.0 (peak tier)
-- `deepseek-chat` (V3) / `deepseek-reasoner` (R1) — legacy aliases
-- `glm-5-2` — default 0 (override in the dashboard ⚙️设置 tab or config; fill from Zhipu's pricing)
+Built-in model pricing (**CNY per 1M tokens**, from [DeepSeek's official pricing page](https://api-docs.deepseek.com/zh-cn/quick_start/pricing), snapshot 2026-08-14):
 
-Unknown models record tokens only (cost = 0) until you set a price. Override anytime via the **⚙️设置 tab** in the dashboard or the WebUI settings card — changes apply to new calls immediately.
+| Model | input (cache miss) | cacheRead (cache hit) | output | cacheWrite |
+|---|---|---|---|---|
+| `deepseek-v4-flash` | 1 | 0.02 | 2 | 1 |
+| `deepseek-v4-pro` | 3 | 0.025 | 6 | 3 |
+| `deepseek-chat` (V3) | 2 | 0.5 | 8 | 2 |
+| `deepseek-reasoner` (R1) | 4 | 1 | 16 | 4 |
+| `glm-5-2` | 0 | 0 | 0 | 0 |
+
+**Key billing facts** (DeepSeek V4 model):
+- `cacheRead` (cache hit) is far **cheaper** than `input` (cache miss) — typically 30–50× cheaper. The plugin reflects this; earlier versions had `cacheRead` *higher* than `input`, which produced wildly inflated costs. If you have ledger data recorded under the old table, totals are recomputed at query time from the current pricing, so simply updating prices fixes displayed totals retroactively.
+- DeepSeek V4 publishes only cache-hit / cache-miss / output. There is **no separate cache-write line**; the plugin bills cache writes at the input (cache-miss) rate, matching DeepSeek's effective model.
+- `glm-5-2` (Zhipu) defaults to 0 — override in the dashboard ⚙️设置 tab or config.
+
+Unknown models record tokens only (cost = 0) until you set a price. Override anytime via the **⚙️设置 tab** in the dashboard or the WebUI settings card — changes apply to new calls **and retroactively to queried totals** immediately (costs are recomputed from token sums at query time).
 
 ## Config
 
@@ -139,16 +148,6 @@ Researched against the `dsh-web-ui` reference. Key finding: **DSH exposes no gen
 - **OS:** the SQLite backend ships a prebuilt win32 binary via `better-sqlite3`; other platforms build from source at install time (requires a C++ toolchain). Verified on Windows 11 / Node 22.
 - **Pre-release caveat:** DSH is in developer preview with expected compatibility-breaking changes. The token-usage source and tool registration API are confirmed against rc.6; a future mainline may rename them, which would require a plugin update.
 
-## Install
-
-```powershell
-dsh plugin --profile web add <path-or-package>
-```
-
-The host discovers the plugin from `package.json` (`dsh.bundle.patch`) — no absolute path, no manual wiring. The `prepare` script builds `lib/` from source, so a git checkout installs self-contained. Restart `dsh web` after install.
-
-> **Git install note:** pnpm ≥10 blocks a git dependency's `prepare` script until allowed. If the first `add` fails, copy the exact package key pnpm printed into the profile's `pnpm-workspace.yaml` (`allowBuilds: dsh-cost-ledger: true`) and re-run — exactly as the official docs describe.
-
 ## Uninstall
 
 ```powershell
@@ -180,15 +179,15 @@ Every model call is now auto-logged. After a few prompts, ask the agent to query
 > 查一下今天花了多少钱（query_cost today）
 ```
 
-Or open the dashboard panel in the Web UI (the cost-ledger tab) to see a live summary, per-model breakdown, and the budget/budget settings — no extra wiring.
+Or open the dashboard panel in the Web UI (the cost-ledger tab) to see a live summary and per-model breakdown — the panel registers the HTTP API backing it; the in-WebUI panel UI itself is Phase 2 (currently a stub entry).
 
 ## Permissions & data
 
 - **Files written:** one SQLite database at `dsh-cost-ledger/ledger.db` (path configurable via `dbPath`, relative to the DSH working directory) plus its WAL/SHM sidecar files. Nothing else touches the filesystem.
 - **Network:** none. The plugin makes no outbound network calls. (The `parse-prices` endpoint calls the **host's** own `ctx.llm.stream()` — it reuses the model call path you already configured, not a new connection.)
 - **Credentials:** none read, stored, or transmitted. The plugin never touches your API keys; it only reads token counts and model names that the host already emits on the `llm/stream` event.
-- **Data logged per model call:** `{timestamp, sessionId, project, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost}`. No prompt content or completions are ever stored — only aggregate token counts and metadata.
-- **HTTP API:** when running under `dsh web`, the plugin registers read-only-ish JSON endpoints under `/api/cost-ledger/*`. They bind to the host's web server and are reachable from the same origin as the Web UI. The `cleanup` and `parse-prices` endpoints are write/POST endpoints intended for the dashboard UI.
+- **Data logged per model call:** `{timestamp, sessionId, project, model, provider, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost}`. No prompt content or completions are ever stored — only aggregate token counts and metadata. `sessionId` is taken from the `llm/stream` event when the host supplies it; `project` is a best-effort label derived from the workspace cwd basename (null when unavailable).
+- **HTTP API:** when running under `dsh web`, the plugin registers JSON endpoints under `/api/cost-ledger/*`. They bind to the host's web server and are reachable from the same origin as the Web UI. The `cleanup`, `config`, and `parse-prices` endpoints are POST write endpoints intended for the dashboard UI; they reject cross-origin writes (require a `Content-Type: application/json` request and same-origin `Origin`/`Referer` when present) so a hostile webpage cannot wipe the ledger or flip pricing via a simple form POST.
 
 ## Troubleshooting
 

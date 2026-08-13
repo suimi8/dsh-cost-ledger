@@ -305,8 +305,29 @@ export class Ledger {
     return buckets
   }
 
-  /** Total cost across all records within an optional range. */
-  totalCost(since?: string, until?: string): number {
+  /**
+   * Total cost across all records within an optional range.
+   *
+   * Cost is recomputed at query time from the supplied priceResolver, so
+   * changing prices retroactively updates totals (the stored cost column is
+   * ignored) — consistent with {@link Ledger.summaryByModel} and
+   * {@link Ledger.spentSince}. Without a resolver, falls back to the stored
+   * cost (for legacy callers / unknown models).
+   */
+  totalCost(
+    since?: string,
+    until?: string,
+    priceResolver?: (model: string) => ModelPriceLike | null,
+  ): number {
+    if (!priceResolver) return this.storedCostSum(since, until)
+    // Recompute per-model from aggregated token sums so we share one source of
+    // truth with summaryByModel (stored cost is never trusted here).
+    const byModel = this.summaryByModel(since, until, priceResolver)
+    return byModel.reduce((s, m) => s + m.cost, 0)
+  }
+
+  /** Sum the stored cost column directly (legacy / no-resolver path). */
+  private storedCostSum(since?: string, until?: string): number {
     const where: string[] = []
     const params: Record<string, string> = {}
     if (since) {
@@ -324,8 +345,43 @@ export class Ledger {
     return row.cost
   }
 
-  /** Cost spent within the current window for a budget label. */
-  spentSince(since: string, model?: string): number {
+  /**
+   * Cost spent within the current window for a budget label. Recomputed from the
+   * supplied priceResolver so budget status and {@link query_cost} totals stay
+   * on the same number after a price change (the stored cost column is ignored).
+   */
+  spentSince(since: string, model?: string, priceResolver?: (model: string) => ModelPriceLike | null): number {
+    if (!priceResolver) return this.storedSpentSince(since, model)
+    // Recompute: sum per-model token costs so the model-scoped and global cases
+    // share the recomputation path with summaryByModel.
+    const where: string[] = ['ts >= @since']
+    const params: Record<string, string> = { since }
+    if (model) {
+      where.push('model = @model')
+      params.model = model
+    }
+    const clause = `WHERE ${where.join(' AND ')}`
+    const rows = this.db
+      .prepare(
+        `SELECT model,
+                COALESCE(SUM(input_tokens), 0) AS inputTokens,
+                COALESCE(SUM(output_tokens), 0) AS outputTokens,
+                COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+                COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens
+           FROM usage ${clause}
+          GROUP BY model`,
+      )
+      .all(params) as { model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }[]
+    let total = 0
+    for (const r of rows) {
+      const p = priceResolver(r.model)
+      if (p) total += recost(p, r)
+    }
+    return total
+  }
+
+  /** Sum the stored cost column directly (legacy / no-resolver path). */
+  private storedSpentSince(since: string, model?: string): number {
     if (model) {
       const row = this.db
         .prepare(
