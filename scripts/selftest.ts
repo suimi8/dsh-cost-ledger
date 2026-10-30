@@ -139,6 +139,45 @@ const rendered = recordCostTool.output.render({}, rec as any)
 check('render returns a text block', Array.isArray(rendered) && rendered[0].type === 'text')
 check('render text is valid JSON', typeof JSON.parse((rendered[0] as any).text) === 'object')
 
+// 16. DeepSeek V4 pricing: cacheRead is MUCH cheaper than input (official page).
+const v4 = resolvePrice('deepseek-v4-flash')!
+check('v4-flash price resolved', v4 !== null)
+check('v4-flash input=1 (CNY)', v4.input === 1)
+check('v4-flash output=2', v4.output === 2)
+check('v4-flash cacheRead=0.02', v4.cacheRead === 0.02)
+check('v4-flash cacheRead cheaper than input', v4.cacheRead < v4.input)
+check('v4-pro cacheRead=0.025 cheaper than input 3', resolvePrice('deepseek-v4-pro')!.cacheRead < 3)
+
+// 17. Longest-prefix wins among built-in keys: a model like 'deepseek-chat'
+// matches the specific built-in entry, and a hypothetical shorter built-in key
+// would not shadow it. We verify the exact-entry path returns the right price.
+check('built-in exact entry wins (deepseek-chat input=2)', resolvePrice('deepseek-chat')!.input === 2)
+check('built-in prefix match returns correct price (deepseek-chat-v2)', resolvePrice('deepseek-chat-v2')!.input === 2)
+// An override always wins over the built-in table (user config is authoritative).
+const overridePricing = { 'deepseek': { input: 99, output: 99, cacheRead: 99, cacheWrite: 99 } }
+check('override prefix matches unknown model', resolvePrice('deepseek-xyz', overridePricing)!.input === 99)
+check('override exact match wins over built-in', resolvePrice('deepseek-chat', overridePricing)!.input === 99)
+
+// 18. Cost accounting consistency: query_cost and spentSince share one number.
+// Insert a deepseek-chat call, then confirm summaryByModel total == spentSince.
+ledger.insert({ ts: new Date().toISOString(), sessionId: null, project: null, provider: null,
+  model: 'deepseek-chat', inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 999 })
+const qAll2 = (await queryCostTool.execute({}, { arguments: {}, signal: new AbortController().signal })) as QueryCostValue
+const todaySince = (function () { const d = new Date(); d.setHours(0, 0, 0, 0); return d.toISOString() })()
+const spentToday = ledger.spentSince(todaySince, undefined, (m) => resolvePrice(m, config.pricing))
+check('query total matches recomputed spentSince', Math.abs(qAll2.totalCost - spentToday) < 1e-9)
+check('recomputed cost ignores stored cost column', qAll2.totalCost < 999)
+
+// 19. query_cost reports budgets created via set_budget.
+await setBudgetTool.execute({ label: 'model:deepseek-reasoner', limit: 0.5, window: 'never' }, { arguments: {}, signal: new AbortController().signal })
+const qWithBudget = (await queryCostTool.execute({}, { arguments: {}, signal: new AbortController().signal })) as QueryCostValue
+check('query_cost reports set_budget budgets', Array.isArray(qWithBudget.budgets) && qWithBudget.budgets!.some((b) => b.label === 'model:deepseek-reasoner'))
+await setBudgetTool.execute({ label: 'model:deepseek-reasoner', limit: 0, remove: true }, { arguments: {}, signal: new AbortController().signal })
+
+// 20. resolvePrice edge cases: empty model returns null; glm-5-2 default is 0.
+check('empty model name returns null', resolvePrice('') === null)
+check('glm-5-2 default price is 0 (override in config)', resolvePrice('glm-5-2')!.input === 0)
+
 ledger.close()
 for (const f of [dbPath, dbPath + '-wal', dbPath + '-shm']) rmSync(f, { force: true })
 

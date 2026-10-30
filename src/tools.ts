@@ -205,6 +205,7 @@ export interface QueryCostValue {
   totalCost: number
   totalCalls: number
   byModel: UsageSummary[]
+  /** Global daily budget from config.defaultDailyBudget, when set. */
   budget?: {
     label: string
     limit: number
@@ -213,6 +214,15 @@ export interface QueryCostValue {
     remaining: number
     exceeded: boolean
   }
+  /** Budgets created via set_budget, with current-window spend status. */
+  budgets?: {
+    label: string
+    limit: number
+    window: string
+    spent: number
+    remaining: number
+    exceeded: boolean
+  }[]
 }
 
 export const queryCostTool: ToolDefinition = {
@@ -236,14 +246,17 @@ export const queryCostTool: ToolDefinition = {
   async execute(args, _exec): Promise<QueryCostValue> {
     const a = args as QueryCostArgs
     const ctx = toolContext!
+    const priceResolver = (model: string) => resolvePrice(model, ctx.config.pricing)
     const since = resolveSince(a.range ?? 'all')
-    const byModel = ctx.ledger.summaryByModel(since, undefined, (model) => resolvePrice(model, ctx.config.pricing))
+    const byModel = ctx.ledger.summaryByModel(since, undefined, priceResolver)
     const totalCost = byModel.reduce((s, m) => s + m.cost, 0)
     const totalCalls = byModel.reduce((s, m) => s + m.calls, 0)
+
+    // Global daily budget (from config), recomputed via the same priceResolver.
     let budget: QueryCostValue['budget']
     const limit = ctx.config.defaultDailyBudget
     if (limit > 0) {
-      const spent = ctx.ledger.spentSince(resolveSince('today')!)
+      const spent = ctx.ledger.spentSince(resolveSince('today')!, undefined, priceResolver)
       budget = {
         label: 'daily',
         limit,
@@ -253,7 +266,25 @@ export const queryCostTool: ToolDefinition = {
         exceeded: spent >= limit,
       }
     }
-    return { totalCost, totalCalls, byModel, budget }
+
+    // Budgets created via set_budget, each with its own window's current spend.
+    const budgets: QueryCostValue['budgets'] = ctx.ledger
+      .listBudgets()
+      .map((b) => {
+        const windowSince = resolveSince(b.window) ?? new Date(0).toISOString()
+        const model = b.label.startsWith('model:') ? b.label.slice('model:'.length) : undefined
+        const spent = ctx.ledger.spentSince(windowSince, model, priceResolver)
+        return {
+          label: b.label,
+          limit: b.limit,
+          window: b.window,
+          spent,
+          remaining: Math.max(0, b.limit - spent),
+          exceeded: spent >= b.limit,
+        }
+      })
+
+    return { totalCost, totalCalls, byModel, ...(budget ? { budget } : {}), budgets }
   },
 }
 
@@ -322,7 +353,7 @@ export const setBudgetTool: ToolDefinition = {
     ctx.ledger.setBudget(row)
     const since = resolveSince(row.window) ?? new Date(0).toISOString()
     const model = a.label.startsWith('model:') ? a.label.slice('model:'.length) : undefined
-    const spent = ctx.ledger.spentSince(since, model)
+    const spent = ctx.ledger.spentSince(since, model, (m) => resolvePrice(m, ctx.config.pricing))
     return {
       label: row.label,
       limit: row.limit,
